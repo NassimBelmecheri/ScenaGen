@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Feb 27 01:33:05 2026
-
-@author: nassim
-"""
 
 """
 Command-line version of the Qualitative Scenario Designer
