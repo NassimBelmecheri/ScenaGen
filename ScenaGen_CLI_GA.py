@@ -22,11 +22,12 @@ import itertools
 import ast
 import pandas as pd
 import numpy as np
-from minizinc import Instance, Model, Solver as MznSolver
+# from minizinc import Instance, Model, Solver as MznSolver
 import datetime
 import nest_asyncio
 import time
 import os
+from ga_solver_jax import JAXGASolver, configure as configure_ga
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.figure import Figure
@@ -379,9 +380,9 @@ class GlobalScenarioSolver:
             + "|".join(", ".join(str(x) for x in row) for row in speed_matrix)
             + "|]"
         )
-
+        # include "globals.mzn";
         mzn = f"""
-        include "globals.mzn";
+        
         int: T = {self.num_frames};
         int: O = {self.num_objs};
         int: MAP_LIMIT = {map_limit};
@@ -473,48 +474,47 @@ class GlobalScenarioSolver:
             if rel == "Equals":
                 return f"{s1} = {s2} /\\ {e1} = {e2}"
             return "true"
+
         def framewise_allen_variable_order(objects, num_frames, ra_matrix, id_map):
 
             num_objects = len(objects)
-        
+
             frame_weight = {}
-        
+
             for t in range(num_frames):
-        
                 weight = 0
-        
-                for (i, j, rx, ry) in ra_matrix[t]:
-        
+
+                for i, j, rx, ry in ra_matrix[t]:
                     weight += ALLEN_WEIGHTS.get(rx, 1)
                     weight += ALLEN_WEIGHTS.get(ry, 1)
-        
+
                 frame_weight[t] = weight
-        
+
             frames_sorted = sorted(frame_weight.keys(), key=lambda x: -frame_weight[x])
-        
+
             var_order = []
-        
+
             for t in frames_sorted:
-        
-                object_weight = {o["id"]:0 for o in objects}
-        
-                for (i, j, rx, ry) in ra_matrix[t]:
-        
-                    w = ALLEN_WEIGHTS.get(rx,1) + ALLEN_WEIGHTS.get(ry,1)
-        
+                object_weight = {o["id"]: 0 for o in objects}
+
+                for i, j, rx, ry in ra_matrix[t]:
+                    w = ALLEN_WEIGHTS.get(rx, 1) + ALLEN_WEIGHTS.get(ry, 1)
+
                     object_weight[i] += w
                     object_weight[j] += w
-        
-                objs_sorted = sorted(object_weight.keys(), key=lambda x: -object_weight[x])
-        
+
+                objs_sorted = sorted(
+                    object_weight.keys(), key=lambda x: -object_weight[x]
+                )
+
                 for oid in objs_sorted:
-        
                     idx = id_map[oid]
-        
-                    var_order.append(f"cx[{idx},{t+1}]")
-                    var_order.append(f"cy[{idx},{t+1}]")
-        
+
+                    var_order.append(f"cx[{idx},{t + 1}]")
+                    var_order.append(f"cy[{idx},{t + 1}]")
+
             return var_order
+
         for t in range(self.num_frames):
             overlapping_objects = set()
             for i, j, rx, ry in ra_matrix[t]:
@@ -595,7 +595,7 @@ class GlobalScenarioSolver:
                     mzn += f"\nconstraint ( {gap} <= {vc});"
                 elif q == "close":
                     mzn += f"\n constraint ({gap} > {vc} /\\ {gap} <= {cl});"
-                    
+
                 elif q == "normal":
                     mzn += f"\n constraint ( {gap} > {cl} /\\  {gap} <= {nr});"
                 elif q == "far":
@@ -603,11 +603,12 @@ class GlobalScenarioSolver:
                 else:
                     mzn += f"\n constraint {gap} > {fa}; "
         if heuristic == "frame-allen":
+            var_order = framewise_allen_variable_order(
+                self.objects, self.num_frames, ra_matrix
+            )
 
-            var_order = framewise_allen_variable_order(self.objects, self.num_frames, ra_matrix)
-            
             order_string = ", ".join(var_order)
-            
+
             mzn += f"""
             
             array[int] of var int: VAR_ORDER = [{order_string}];
@@ -620,8 +621,7 @@ class GlobalScenarioSolver:
             ) satisfy;
             
             """
-            
-         
+
         if prev_result is not None:
             cx_ref = [list() for _ in range(self.num_objs)]
             cy_ref = [list() for _ in range(self.num_objs)]
@@ -648,6 +648,11 @@ class GlobalScenarioSolver:
         """
         else:
             mzn += "\nsolve satisfy;"
+
+        # mzn += "\nsolve satisfy;"
+
+        # TODO If optimization, return first result as solution
+        # Still track all results
 
         # -----------------------
         # RUN SOLVER
@@ -738,6 +743,480 @@ class GlobalScenarioSolver:
             output.append(frame)
 
         return output, intermediate_solution_stats
+
+    # -------------------------------------------------
+    # MINIZINC VALIDATION OF EXTERNAL SOLUTIONS
+    # -------------------------------------------------
+
+    def validate_solution(self, ga_result, ra_matrix, qdc_matrix, velocities):
+        """
+        Validate a solution (e.g. from the GA solver) against the qualitative
+        constraints by fixing the coordinates in a MiniZinc model and checking
+        satisfiability of ALL constraints matching the MiniZinc solver model.
+
+        Returns (is_valid: bool, message: str)
+        """
+        map_limit = Config.MAP_LIMIT
+
+        # ---- extract GA coordinates into 2-D arrays (obj × frame) --------
+        sorted_objs = sorted(self.objects, key=lambda o: self.id_map[o["id"]])
+
+        x_min_arr, x_max_arr, y_min_arr, y_max_arr = [], [], [], []
+        cx_arr, cy_arr = [], []
+        for obj in sorted_objs:
+            oid = obj["id"]
+            xn, xx, yn, yx, cxs, cys = [], [], [], [], [], []
+            for t in range(self.num_frames):
+                obj_data = next((o for o in ga_result[t] if o["id"] == oid), None)
+                if obj_data is None:
+                    return False, f"Object {oid} not found in GA result frame {t}"
+                xn.append(int(round(obj_data["x_min"])))
+                xx.append(int(round(obj_data["x_max"])))
+                yn.append(int(round(obj_data["y_min"])))
+                yx.append(int(round(obj_data["y_max"])))
+                cxs.append(int(round(obj_data["x"])))
+                cys.append(int(round(obj_data["y"])))
+            x_min_arr.append(xn)
+            x_max_arr.append(xx)
+            y_min_arr.append(yn)
+            y_max_arr.append(yx)
+            cx_arr.append(cxs)
+            cy_arr.append(cys)
+
+        # ---- count constraints for reporting -----------------------------
+        n_ra = sum(len(ra_matrix[t]) for t in range(self.num_frames))
+        n_qdc = sum(len(qdc_matrix[t]) for t in range(self.num_frames))
+
+        # ---- run MiniZinc check ------------------------------------------
+        is_valid, mzn_msg = self._mzn_check(
+            x_min_arr,
+            x_max_arr,
+            y_min_arr,
+            y_max_arr,
+            cx_arr,
+            cy_arr,
+            ra_matrix,
+            qdc_matrix,
+            velocities,
+            map_limit,
+        )
+
+        if not is_valid:
+            # Diagnose which constraints failed
+            violations = self._diagnose_violations(
+                x_min_arr,
+                x_max_arr,
+                y_min_arr,
+                y_max_arr,
+                cx_arr,
+                cy_arr,
+                ra_matrix,
+                qdc_matrix,
+                velocities,
+            )
+            msg = f"{mzn_msg}\n    Violations ({len(violations)}):"
+            for v in violations[:10]:
+                msg += f"\n      {v}"
+            if len(violations) > 10:
+                msg += f"\n      ... and {len(violations) - 10} more"
+            return False, msg
+
+        return True, f"{n_ra} RA + {n_qdc} QDC constraints satisfied"
+
+    # .................................................................
+
+    def _mzn_check(
+        self,
+        x_min_arr,
+        x_max_arr,
+        y_min_arr,
+        y_max_arr,
+        cx_arr,
+        cy_arr,
+        ra_matrix,
+        qdc_matrix,
+        velocities,
+        map_limit,
+    ):
+        """Build and solve a MiniZinc model that pins coordinates and checks
+        ALL constraints matching the MiniZinc solver model exactly.
+        Returns (is_valid, message)."""
+
+        bound = map_limit * 10
+        n_ra = sum(len(ra_matrix[t]) for t in range(self.num_frames))
+        n_qdc = sum(len(qdc_matrix[t]) for t in range(self.num_frames))
+
+        # Ego solver index (1-based for MiniZinc)
+        ego_solver_index = None
+        for obj in self.objects:
+            if obj["category"] == "ego":
+                ego_solver_index = self.id_map[obj["id"]]
+                break
+
+        speed_to_value = Config.SPEED_LIMITS
+
+        mzn = f"""
+int: T = {self.num_frames};
+int: O = {self.num_objs};
+int: MAP_LIMIT = {map_limit};
+int: BOUND = {bound};
+
+set of int: FRAMES = 1..T;
+set of int: OBJS   = 1..O;
+
+array[OBJS, FRAMES] of int: speed_limit;
+array[OBJS] of int: size_rank;
+
+array[OBJS, FRAMES] of int: x_min_fixed;
+array[OBJS, FRAMES] of int: x_max_fixed;
+array[OBJS, FRAMES] of int: y_min_fixed;
+array[OBJS, FRAMES] of int: y_max_fixed;
+array[OBJS, FRAMES] of int: cx_fixed;
+array[OBJS, FRAMES] of int: cy_fixed;
+
+array[OBJS, FRAMES] of var -BOUND..BOUND: x_min;
+array[OBJS, FRAMES] of var -BOUND..BOUND: x_max;
+array[OBJS, FRAMES] of var -BOUND..BOUND: y_min;
+array[OBJS, FRAMES] of var -BOUND..BOUND: y_max;
+array[OBJS, FRAMES] of var -BOUND..BOUND: cx;
+array[OBJS, FRAMES] of var -BOUND..BOUND: cy;
+array[OBJS] of var 4..MAP_LIMIT div 4: size;
+
+% Pin all values
+constraint forall(o in OBJS, t in FRAMES)(
+    x_min[o,t] = x_min_fixed[o,t] /\\
+    x_max[o,t] = x_max_fixed[o,t] /\\
+    y_min[o,t] = y_min_fixed[o,t] /\\
+    y_max[o,t] = y_max_fixed[o,t] /\\
+    cx[o,t] = cx_fixed[o,t] /\\
+    cy[o,t] = cy_fixed[o,t]
+);
+
+% Square bbox constraint
+constraint forall(o in OBJS, t in FRAMES)(
+    x_max[o,t] - x_min[o,t] = size[o] /\\
+    y_max[o,t] - y_min[o,t] = size[o] /\\
+    x_min[o,t] < x_max[o,t] /\\
+    y_min[o,t] < y_max[o,t]
+);
+
+% Center definitions
+constraint forall(o in OBJS, t in FRAMES)(
+    2 * cx[o,t] = x_min[o,t] + x_max[o,t] /\\
+    2 * cy[o,t] = y_min[o,t] + y_max[o,t]
+);
+"""
+
+        # Ego at origin all frames
+        if ego_solver_index is not None:
+            mzn += f"""
+constraint forall(t in FRAMES)(
+    cx[{ego_solver_index},t] = 0 /\\
+    cy[{ego_solver_index},t] = 0
+);
+"""
+
+        # Size ordering
+        mzn += """
+constraint forall(o1,o2 in OBJS where size_rank[o1] < size_rank[o2])(
+    size[o1] + 2 <= size[o2]
+);
+"""
+
+        # Speed constraint
+        mzn += """
+constraint forall(o in OBJS, t in 1..T-1)(
+    abs(cx[o,t+1] - cx[o,t]) +
+    abs(cy[o,t+1] - cy[o,t])
+    <= speed_limit[o,t]
+);
+"""
+
+        # Allen helper
+        def allen(rel, s1, e1, s2, e2):
+            if rel == "Before":
+                return f"{e1} < {s2}"
+            if rel == "After":
+                return f"{s1} > {e2}"
+            if rel == "Meets":
+                return f"{e1} = {s2}"
+            if rel == "MetBy":
+                return f"{s1} = {e2}"
+            if rel == "Overlaps":
+                return f"{s1} < {s2} /\\ {s2} < {e1} /\\ {e1} < {e2}"
+            if rel == "OverlappedBy":
+                return f"{s2} < {s1} /\\ {s1} < {e2} /\\ {e2} < {e1}"
+            if rel == "During":
+                return f"{s1} > {s2} /\\ {e1} < {e2}"
+            if rel == "Contains":
+                return f"{s1} < {s2} /\\ {e1} > {e2}"
+            if rel == "Starts":
+                return f"{s1} = {s2} /\\ {e1} < {e2}"
+            if rel == "StartedBy":
+                return f"{s1} = {s2} /\\ {e1} > {e2}"
+            if rel == "Finishes":
+                return f"{e1} = {e2} /\\ {s1} > {s2}"
+            if rel == "FinishedBy":
+                return f"{e1} = {e2} /\\ {s1} < {s2}"
+            if rel == "Equals":
+                return f"{s1} = {s2} /\\ {e1} = {e2}"
+            return "true"
+
+        for t in range(self.num_frames):
+            for i, j, rx, ry in ra_matrix[t]:
+                idx1, idx2 = self.id_map[i], self.id_map[j]
+                cx_c = allen(
+                    rx,
+                    f"x_min[{idx1},{t + 1}]",
+                    f"x_max[{idx1},{t + 1}]",
+                    f"x_min[{idx2},{t + 1}]",
+                    f"x_max[{idx2},{t + 1}]",
+                )
+                cy_c = allen(
+                    ry,
+                    f"y_min[{idx1},{t + 1}]",
+                    f"y_max[{idx1},{t + 1}]",
+                    f"y_min[{idx2},{t + 1}]",
+                    f"y_max[{idx2},{t + 1}]",
+                )
+                mzn += f"\nconstraint ({cx_c}) /\\ ({cy_c});"
+
+        # QDC
+        vc = Config.MANHATTAN_THRESHOLDS["very close"]
+        cl = Config.MANHATTAN_THRESHOLDS["close"]
+        nr = Config.MANHATTAN_THRESHOLDS["normal"]
+        fa = Config.MANHATTAN_THRESHOLDS["far"]
+
+        mzn += f"""
+function var int: gap_x(var int: a1, var int: a2, var int: b1, var int: b2) =
+    max(0, max(a1 - b2, b1 - a2));
+function var int: gap_y(var int: a1, var int: a2, var int: b1, var int: b2) =
+    max(0, max(a1 - b2, b1 - a2));
+"""
+
+        for t in range(self.num_frames):
+            for i, j, q in qdc_matrix[t]:
+                idx1, idx2 = self.id_map[i], self.id_map[j]
+                gap = (
+                    f"gap_x(x_min[{idx1},{t + 1}], x_max[{idx1},{t + 1}],"
+                    f"       x_min[{idx2},{t + 1}], x_max[{idx2},{t + 1}])"
+                    f" + "
+                    f"gap_y(y_min[{idx1},{t + 1}], y_max[{idx1},{t + 1}],"
+                    f"       y_min[{idx2},{t + 1}], y_max[{idx2},{t + 1}])"
+                )
+                if q == "very close":
+                    mzn += f"\nconstraint {gap} <= {vc};"
+                elif q == "close":
+                    mzn += f"\nconstraint {gap} > {vc} /\\ {gap} <= {cl};"
+                elif q == "normal":
+                    mzn += f"\nconstraint {gap} > {cl} /\\ {gap} <= {nr};"
+                elif q == "far":
+                    mzn += f"\nconstraint {gap} > {nr} /\\ {gap} <= {fa};"
+                else:
+                    mzn += f"\nconstraint {gap} > {fa};"
+
+        mzn += "\nsolve satisfy;"
+
+        model = Model()
+        model.add_string(mzn)
+        solver = MznSolver.lookup("gecode")
+        inst = Instance(solver, model)
+
+        inst["x_min_fixed"] = x_min_arr
+        inst["x_max_fixed"] = x_max_arr
+        inst["y_min_fixed"] = y_min_arr
+        inst["y_max_fixed"] = y_max_arr
+        inst["cx_fixed"] = cx_arr
+        inst["cy_fixed"] = cy_arr
+
+        # Size rank
+        sorted_objs = sorted(self.objects, key=lambda o: self.id_map[o["id"]])
+        size_rank = [self.rank_map.get(o["category"], 2) for o in sorted_objs]
+        inst["size_rank"] = size_rank
+
+        # Speed matrix
+        speed_matrix = []
+        for obj in sorted_objs:
+            oid = obj["id"]
+            row = []
+            for t in range(self.num_frames):
+                speed_cat = velocities.get((oid, t), "normal")
+                row.append(speed_to_value.get(speed_cat, 22))
+            speed_matrix.append(row)
+        inst["speed_limit"] = speed_matrix
+
+        try:
+            res = inst.solve(timeout=datetime.timedelta(seconds=30))
+            if res.status.has_solution():
+                return True, f"{n_ra} RA + {n_qdc} QDC constraints satisfied"
+            else:
+                return False, f"UNSAT — checked {n_ra} RA + {n_qdc} QDC"
+        except Exception as e:
+            return False, f"Validation error: {e}"
+
+    # .................................................................
+
+    def _diagnose_violations(
+        self,
+        x_min_arr,
+        x_max_arr,
+        y_min_arr,
+        y_max_arr,
+        cx_arr,
+        cy_arr,
+        ra_matrix,
+        qdc_matrix,
+        velocities,
+    ):
+        """Python-side check to list individual constraint violations."""
+        violations = []
+
+        def _check_allen(rel, s1, e1, s2, e2):
+            if rel == "Before":
+                return e1 < s2
+            if rel == "After":
+                return s1 > e2
+            if rel == "Meets":
+                return e1 == s2
+            if rel == "MetBy":
+                return s1 == e2
+            if rel == "Overlaps":
+                return s1 < s2 and s2 < e1 and e1 < e2
+            if rel == "OverlappedBy":
+                return s2 < s1 and s1 < e2 and e2 < e1
+            if rel == "During":
+                return s1 > s2 and e1 < e2
+            if rel == "Contains":
+                return s1 < s2 and e1 > e2
+            if rel == "Starts":
+                return s1 == s2 and e1 < e2
+            if rel == "StartedBy":
+                return s1 == s2 and e1 > e2
+            if rel == "Finishes":
+                return e1 == e2 and s1 > s2
+            if rel == "FinishedBy":
+                return e1 == e2 and s1 < s2
+            if rel == "Equals":
+                return s1 == s2 and e1 == e2
+            return True
+
+        def _bbox(obj_idx, t):
+            """Return (x_min, x_max, y_min, y_max) for solver obj_idx at frame t."""
+            i = obj_idx - 1  # 0-based index into arrays
+            return (x_min_arr[i][t], x_max_arr[i][t], y_min_arr[i][t], y_max_arr[i][t])
+
+        thresholds = Config.MANHATTAN_THRESHOLDS
+        speed_to_value = Config.SPEED_LIMITS
+
+        # Ego at origin (all frames)
+        ego_solver_index = None
+        for obj in self.objects:
+            if obj["category"] == "ego":
+                ego_solver_index = self.id_map[obj["id"]]
+                break
+
+        if ego_solver_index is not None:
+            i = ego_solver_index - 1
+            for t in range(self.num_frames):
+                cx = cx_arr[i][t]
+                cy = cy_arr[i][t]
+                if cx != 0 or cy != 0:
+                    violations.append(
+                        f"EGO f{t}: expected cx=0,cy=0, got cx={cx},cy={cy}"
+                    )
+
+        # Square bbox check
+        sorted_objs = sorted(self.objects, key=lambda o: self.id_map[o["id"]])
+        for i, obj in enumerate(sorted_objs):
+            for t in range(self.num_frames):
+                w = x_max_arr[i][t] - x_min_arr[i][t]
+                h = y_max_arr[i][t] - y_min_arr[i][t]
+                if w != h:
+                    violations.append(
+                        f"BBOX f{t} obj({obj['id']}): not square w={w} h={h}"
+                    )
+
+        # Size ordering
+        sizes = []
+        for i in range(self.num_objs):
+            sizes.append(x_max_arr[i][0] - x_min_arr[i][0])
+        size_rank = [self.rank_map.get(o["category"], 2) for o in sorted_objs]
+        for i in range(self.num_objs):
+            for j in range(self.num_objs):
+                if size_rank[i] < size_rank[j]:
+                    if sizes[i] + 2 > sizes[j]:
+                        violations.append(
+                            f"SIZE obj({sorted_objs[i]['id']}) rank={size_rank[i]} "
+                            f"size={sizes[i]} vs obj({sorted_objs[j]['id']}) "
+                            f"rank={size_rank[j]} size={sizes[j]}: "
+                            f"need size[small]+2 <= size[big]"
+                        )
+
+        # Speed constraints
+        for i, obj in enumerate(sorted_objs):
+            oid = obj["id"]
+            for t in range(self.num_frames - 1):
+                speed_cat = velocities.get((oid, t), "normal")
+                lim = speed_to_value.get(speed_cat, 22)
+                dx = abs(cx_arr[i][t + 1] - cx_arr[i][t])
+                dy = abs(cy_arr[i][t + 1] - cy_arr[i][t])
+                movement = dx + dy
+                if movement > lim:
+                    violations.append(
+                        f"SPEED f{t} obj({oid}): movement={movement} > limit={lim} "
+                        f"(speed={speed_cat})"
+                    )
+
+        for t in range(self.num_frames):
+            # RA
+            for oid1, oid2, rx, ry in ra_matrix[t]:
+                idx1, idx2 = self.id_map[oid1], self.id_map[oid2]
+                b1 = _bbox(idx1, t)
+                b2 = _bbox(idx2, t)
+                ok_x = _check_allen(rx, b1[0], b1[1], b2[0], b2[1])
+                ok_y = _check_allen(ry, b1[2], b1[3], b2[2], b2[3])
+                if not (ok_x and ok_y):
+                    actual_rx = get_ra_string(b1[0], b1[1], b2[0], b2[1])
+                    actual_ry = get_ra_string(b1[2], b1[3], b2[2], b2[3])
+                    violations.append(
+                        f"RA  f{t} obj({oid1},{oid2}): "
+                        f"expected ({rx},{ry}), got ({actual_rx},{actual_ry})"
+                    )
+
+            # QDC — two-sided constraints matching MiniZinc solver model
+            upper_bounds = {
+                "very close": thresholds["very close"],
+                "close": thresholds["close"],
+                "normal": thresholds["normal"],
+                "far": thresholds["far"],
+            }
+            lower_bounds = {
+                "close": thresholds["very close"],
+                "normal": thresholds["close"],
+                "far": thresholds["normal"],
+                "very far": thresholds["far"],
+            }
+            for oid1, oid2, q in qdc_matrix[t]:
+                idx1, idx2 = self.id_map[oid1], self.id_map[oid2]
+                b1 = _bbox(idx1, t)
+                b2 = _bbox(idx2, t)
+                dx = max(0, max(b1[0] - b2[1], b2[0] - b1[1]))
+                dy = max(0, max(b1[2] - b2[3], b2[2] - b1[3]))
+                gap = dx + dy
+                upper = upper_bounds.get(q)
+                if upper is not None and gap > upper:
+                    violations.append(
+                        f"QDC f{t} obj({oid1},{oid2}): "
+                        f"expected {q} (gap<={upper}), got gap={gap} (+{gap - upper})"
+                    )
+                lower = lower_bounds.get(q)
+                if lower is not None and gap <= lower:
+                    violations.append(
+                        f"QDC f{t} obj({oid1},{oid2}): "
+                        f"expected {q} (gap>{lower}), got gap={gap}"
+                    )
+
+        return violations
 
 
 # ==========================================
@@ -1048,167 +1527,162 @@ class CLIScenarioDesigner:
 
         df = pd.read_csv(filepath)
 
-        df= df[df['object_pair'].apply(lambda x: 'ego' in x)]
-    
+        df = df[df["object_pair"].apply(lambda x: "ego" in x)]
+
         if df.empty:
             raise ValueError("No rows found")
-    
+
         # --------------------------------
         # Frames
         # --------------------------------
         frames = sorted(df["frameidx"].unique())
         self.num_frames = len(frames)
-    
-        frame_map = {f:i for i,f in enumerate(frames)}
-    
+
+        frame_map = {f: i for i, f in enumerate(frames)}
+
         # --------------------------------
         # Extract objects
         # --------------------------------
         objects = set()
-    
+
         for p in df["object_pair"]:
-    
-            o1,o2 = ast.literal_eval(p)
-    
+            o1, o2 = ast.literal_eval(p)
+
             objects.add(str(o1))
             objects.add(str(o2))
-    
-        obj_map = {name:i+1 for i,name in enumerate(sorted(objects))}
-    
+
+        obj_map = {name: i + 1 for i, name in enumerate(sorted(objects))}
+
         self.objects = []
-    
-        for name,oid in obj_map.items():
-    
+
+        for name, oid in obj_map.items():
             category = self._map_category(name)
-    
-            self.objects.append({
-                "id": oid,
-                "category": category,
-                "name": name
-            })
-    
+
+            self.objects.append({"id": oid, "category": category, "name": name})
+
         # --------------------------------
         # Init matrices
         # --------------------------------
         self.ra_matrix = [set() for _ in range(self.num_frames)]
         self.qdc_matrix = [set() for _ in range(self.num_frames)]
-    
+
         self.speeds = {}
         self.headings = {}
-    
+
         # --------------------------------
         # RA mapping
         # --------------------------------
         ra_map = {
-            "B":"Before",
-            "BI":"After",
-            "M":"Meets",
-            "MI":"MetBy",
-            "O":"Overlaps",
-            "OI":"OverlappedBy",
-            "D":"During",
-            "DI":"Contains",
-            "S":"Starts",
-            "SI":"StartedBy",
-            "F":"Finishes",
-            "FI":"FinishedBy",
-            "E":"Equals"
+            "B": "Before",
+            "BI": "After",
+            "M": "Meets",
+            "MI": "MetBy",
+            "O": "Overlaps",
+            "OI": "OverlappedBy",
+            "D": "During",
+            "DI": "Contains",
+            "S": "Starts",
+            "SI": "StartedBy",
+            "F": "Finishes",
+            "FI": "FinishedBy",
+            "E": "Equals",
         }
-    
+
         # --------------------------------
         # Heading parser
         # --------------------------------
         def parse_heading(h):
-    
-            h=str(h).lower()
-    
+
+            h = str(h).lower()
+
             if "north" in h or "south" in h:
                 return 1
-    
+
             if "east" in h or "west" in h:
                 return 0
-    
+
             return -1
-    
+
         # --------------------------------
         # Speed parser
         # --------------------------------
         def parse_speed(s):
-    
-            s=str(s).lower()
-    
+
+            s = str(s).lower()
+
             if "not" in s:
                 return "not moving"
-    
+
             if "slow" in s:
                 return "slow"
-    
+
             if "fast" in s:
                 return "fast"
             if "very fast" in s:
                 return "fast"
-    
+
             return "normal"
-    
+
         # --------------------------------
         # Fill matrices
         # --------------------------------
-        for _,row in df.iterrows():
-    
+        for _, row in df.iterrows():
             t = frame_map[row["frameidx"]]
-    
-            o1,o2 = ast.literal_eval(row["object_pair"])
-    
+
+            o1, o2 = ast.literal_eval(row["object_pair"])
+
             id1 = obj_map[str(o1)]
             id2 = obj_map[str(o2)]
-    
-            # ---------------- RA ----------------
-            rx,ry = ast.literal_eval(row["RA"])
 
-            rx = ra_map.get(rx[:-1],"")
-            ry = ra_map.get(ry[:-1],"")
-    
-            self.ra_matrix[t].add((id1,id2,rx,ry))
-    
+            # ---------------- RA ----------------
+            rx, ry = ast.literal_eval(row["RA"])
+
+            rx = ra_map.get(rx[:-1], "")
+            ry = ra_map.get(ry[:-1], "")
+
+            self.ra_matrix[t].add((id1, id2, rx, ry))
+
             # ---------------- QDC ----------------
             dist = str(row["distance_x"]).lower()
-    
+
             if "very" in dist:
-                q="very close"
+                q = "very close"
             elif "close" in dist:
-                q="close"
+                q = "close"
             elif "far" in dist:
-                q="far"
-            elif 'very far' in dist:
-                q='very far'
+                q = "far"
+            elif "very far" in dist:
+                q = "very far"
             else:
-                q="normal"
-    
-            self.qdc_matrix[t].add((id1,id2,q))
-    
+                q = "normal"
+
+            self.qdc_matrix[t].add((id1, id2, q))
+
             # ---------------- speeds ----------------
-            self.speeds[(id1,t)] = parse_speed(row["speed_o1"])
-            self.speeds[(id2,t)] = parse_speed(row["speed_o2"])
-    
+            self.speeds[(id1, t)] = parse_speed(row["speed_o1"])
+            self.speeds[(id2, t)] = parse_speed(row["speed_o2"])
+
             # ---------------- headings ----------------
-            self.headings[(id1,t)] = parse_heading(row["heading_o1"])
-            self.headings[(id2,t)] = parse_heading(row["heading_o2"])
-    
+            self.headings[(id1, t)] = parse_heading(row["heading_o1"])
+            self.headings[(id2, t)] = parse_heading(row["heading_o2"])
+
         print(f"Loaded {len(self.objects)} objects")
         print(f"{self.num_frames} frames")
         # --------------------------------
         # Initialize map size (missing!)
         # --------------------------------
-        
-        self.map_limit = 100#Config.calculate_map_size(len(self.objects), self.objects)
-        
+
+        self.map_limit = (
+            100  # Config.calculate_map_size(len(self.objects), self.objects)
+        )
+
         Config.MAP_LIMIT = self.map_limit
-        
+
         Config.MANHATTAN_THRESHOLDS = Config.calculate_thresholds(self.map_limit)
-        
+
         print(f"Map size initialized: {self.map_limit}")
         print("Distance thresholds:")
-        for k,v in Config.MANHATTAN_THRESHOLDS.items():
+        for k, v in Config.MANHATTAN_THRESHOLDS.items():
             print(f"  {k}: {v}")
         return self.objects
 
@@ -1347,17 +1821,18 @@ class CLIScenarioDesigner:
                     return inconsistent_objects
 
         return inconsistent_objects
-    
+
     def solve(
-        self, solver_name="gecode", heuristic="default", timeout=None, refinements=0
+        self, solver_name="ga", heuristic="default", timeout=None, refinements=0, population_size=100
     ):
         """
         Solve the current scenario and return (result, stats)
         """
+        if solver_name != "ga":
+            raise Exception("This is the GA file")
+        
         all_results = []
         all_stats = []
-
-        solver = GlobalScenarioSolver(self.objects, self.num_frames)
 
         full_ra_matrix = copy.deepcopy(self.ra_matrix)
         full_qdc_matrix = copy.deepcopy(self.qdc_matrix)
@@ -1389,76 +1864,59 @@ class CLIScenarioDesigner:
 
         # We ramp density from 0% to 100% over the refinements.
         # That means first run is always almost empty
-        densities = [0.0] + [((i + 1) / refinements) for i in range(refinements)]
-
-        reduced_size = count_constraints(self.ra_matrix, self.qdc_matrix)
-
-        result, stats = solver.solve_with_stats(
+        # densities = [0.0] + [((i + 1) / refinements) for i in range(refinements)]
+        # reduced_size = count_constraints(self.ra_matrix, self.qdc_matrix)
+            
+        # Configure the GA module with the CLI's current settings
+        configure_ga(
+            map_limit=Config.MAP_LIMIT,
+            thresholds=Config.MANHATTAN_THRESHOLDS,
+            dimensions=Config.DIMENSIONS,
+        )
+        solver = JAXGASolver(self.objects, self.num_frames)
+        start = time.time()
+        ga_timeout = timeout if timeout is not None else 60.0
+        result = solver.solve(
             self.ra_matrix,
             self.qdc_matrix,
             self.speeds,
             self.headings,
-            solver_name=solver_name,
-            heuristic=heuristic,
-            timeout=timeout,
+            timeout=ga_timeout,
+            sol_per_pop=population_size,
+            speed_limits=Config.SPEED_LIMITS,
         )
-        stats["density"] = density(self.ra_matrix, self.qdc_matrix)
-        stats["refinement"] = 0
+        elapsed = time.time() - start
+        stats = {
+            "time": elapsed,
+            "status": "SOLVED" if result else "UNSAT",
+            "solver": "ga",
+            "heuristic": "GA",
+            "num_objects": len(self.objects),
+            "num_frames": self.num_frames,
+            "map_limit": Config.MAP_LIMIT,
+            "density": density(self.ra_matrix, self.qdc_matrix),
+            "refinement": 0
+        }
         all_results.append(result)
         all_stats.append(stats)
-        # print(result)
-        print(stats)
+        # Validate GA solution with MiniZinc
+        # if result is not None:
+        #     print("\nValidating GA solution with MiniZinc...")
+        #     validator = GlobalScenarioSolver(self.objects, self.num_frames)
+        #     is_valid, msg = validator.validate_solution(
+        #         result, self.ra_matrix, self.qdc_matrix, self.speeds
+        #     )
+        #     stats["mzn_validated"] = is_valid
+        #     stats["mzn_validation_msg"] = msg
+        #     if is_valid:
+        #         print(f"  MiniZinc validation: PASSED ({msg})")
+        #     else:
+        #         print(f"  MiniZinc validation: FAILED ({msg})")
+        #         stats["status"] = "INVALID"
 
-        print(
-            f"Density: {reduced_size} constraints (reduced from {full_size}) ({stats['density']:.1%})"
-        )
-
-        if stats["status"] != "SOLVED":
-            return all_results, all_stats
-
-        for refine_iteration in range(1, refinements + 1):
-            next_density = densities[refine_iteration]
-
-            current_density = density(self.ra_matrix, self.qdc_matrix)
-
-            if current_density < next_density:
-                # Randomly add back constraints until we reach the next density level
-                # Calculate number of missing constraints
-                missing_constraints = full_size - count_constraints(
-                    self.ra_matrix, self.qdc_matrix
-                )
-                target_constraints = int(full_size * next_density)
-                num_constraints_to_add = target_constraints - (
-                    full_size - missing_constraints
-                )
-            else:
-                num_constraints_to_add = 1  # Just add one constraint if we're already above the target density
-
-            constraints_to_add = constraint_queue[:num_constraints_to_add]
-            constraint_queue = constraint_queue[num_constraints_to_add:]
-
-            for t, constraint_type, constraint in constraints_to_add:
-                if constraint_type == "ra":
-                    self.ra_matrix[t].append(constraint)
-                elif constraint_type == "qdc":
-                    self.qdc_matrix[t].append(constraint)
-
-            result2, stats2 = solver.solve_with_stats(
-                self.ra_matrix,
-                self.qdc_matrix,
-                self.speeds,
-                self.headings,
-                solver_name=solver_name,
-                heuristic=heuristic,
-                timeout=timeout,
-                prev_result=all_results[-1],
-            )
-            stats2["density"] = density(self.ra_matrix, self.qdc_matrix)
-            stats2["refinement"] = refine_iteration
-            all_results.append(result2)
-            all_stats.append(stats2)
-            # print(result2)
-            print(stats2)
+        # TODO Refinement not implemented
+        # Requires timeout or objective threshold to determine
+        # terminal criterion
 
         return all_results, all_stats
 
@@ -1619,6 +2077,7 @@ class CLIScenarioDesigner:
             "peak_depth": stats.get("peakDepth", None),
             "memory_used_mb": stats.get("memory", None),
             "status": stats.get("status", "UNKNOWN"),
+            "mzn_validated": stats.get("mzn_validated", None),
         }
 
         # Create DataFrame
@@ -1963,104 +2422,117 @@ class CLIScenarioDesigner:
                 plt.close(fig)
 
         return figures
-    def reconstruct_and_compare(self, result, output_file=None):
 
+    def reconstruct_and_compare(self, result, output_file=None):
         """
         Reconstruct qualitative relations from solver output
         and compare them with the original RA/QDC constraints.
         """
-    
+
         reconstructed_ra = [set() for _ in range(self.num_frames)]
         reconstructed_qdc = [set() for _ in range(self.num_frames)]
-    
+
         mismatches = []
-    
+
         for t, frame in enumerate(result):
-    
             # build objects list for relation computation
             objs = []
-    
+
             for o in frame:
-                objs.append({
-                    "id": o["id"],
-                    "cat": o["category"],
-                    "x": o["x"],
-                    "y": o["y"],
-                    "heading": self.headings.get((o["id"], t), -1)
-                })
-    
+                objs.append(
+                    {
+                        "id": o["id"],
+                        "cat": o["category"],
+                        "x": o["x"],
+                        "y": o["y"],
+                        "heading": self.headings.get((o["id"], t), -1),
+                    }
+                )
+
             # compute relations
             for i, o1 in enumerate(objs):
-                for o2 in objs[i+1:]:
-                    if o2['cat']=='ego':
+                for o2 in objs[i + 1 :]:
+                    if o2["cat"] == "ego":
                         bbox1 = self.get_bbox_logic(o1)
                         bbox2 = self.get_bbox_logic(o2)
-        
+
                         ra_x = get_ra_string(bbox1[0], bbox1[1], bbox2[0], bbox2[1])
                         ra_y = get_ra_string(bbox1[2], bbox1[3], bbox2[2], bbox2[3])
-        
+
                         qdc = get_qdc_string(o1, o2)
-        
+
                         reconstructed_ra[t].add((o1["id"], o2["id"], ra_x, ra_y))
                         reconstructed_qdc[t].add((o1["id"], o2["id"], qdc))
                         # check mismatch
                         if (o1["id"], o2["id"], ra_x, ra_y) not in self.ra_matrix[t]:
-                            mismatches.append({
-                                "frame": t,
-                                "type": "RA",
-                                "pair": (o1["id"], o2["id"]),
-                                "expected": next(
-                                    (r for r in self.ra_matrix[t]
-                                     if r[0]==o1["id"] and r[1]==o2["id"]),
-                                    None
-                                ),
-                                "reconstructed": (ra_x, ra_y)
-                            })
-        
+                            mismatches.append(
+                                {
+                                    "frame": t,
+                                    "type": "RA",
+                                    "pair": (o1["id"], o2["id"]),
+                                    "expected": next(
+                                        (
+                                            r
+                                            for r in self.ra_matrix[t]
+                                            if r[0] == o1["id"] and r[1] == o2["id"]
+                                        ),
+                                        None,
+                                    ),
+                                    "reconstructed": (ra_x, ra_y),
+                                }
+                            )
+
                         if (o1["id"], o2["id"], qdc) not in self.qdc_matrix[t]:
-                            mismatches.append({
-                                "frame": t,
-                                "type": "QDC",
-                                "pair": (o1["id"], o2["id"]),
-                                "expected": next(
-                                    (r for r in self.qdc_matrix[t]
-                                     if r[0]==o1["id"] and r[1]==o2["id"]),
-                                    None
-                                ),
-                                "reconstructed": qdc
-                            })
-    
+                            mismatches.append(
+                                {
+                                    "frame": t,
+                                    "type": "QDC",
+                                    "pair": (o1["id"], o2["id"]),
+                                    "expected": next(
+                                        (
+                                            r
+                                            for r in self.qdc_matrix[t]
+                                            if r[0] == o1["id"] and r[1] == o2["id"]
+                                        ),
+                                        None,
+                                    ),
+                                    "reconstructed": qdc,
+                                }
+                            )
+
         print("\n==============================")
         print("RECONSTRUCTION CHECK")
         print("==============================")
-    
+
         if len(mismatches) == 0:
             print("✓ Perfect reconstruction: solution matches qualitative graph")
         else:
             print(f"⚠ {len(mismatches)} mismatches found")
-    
+
             for m in mismatches[:20]:
                 print(m)
-    
+
         # optionally save comparison
         if output_file:
-    
             rows = []
-    
+
             for m in mismatches:
-                rows.append({
-                    "frame": m["frame"],
-                    "type": m["type"],
-                    "object1": m["pair"][0],
-                    "object2": m["pair"][1],
-                    "expected": m["expected"],
-                    "reconstructed": m["reconstructed"]
-                })
-    
+                rows.append(
+                    {
+                        "frame": m["frame"],
+                        "type": m["type"],
+                        "object1": m["pair"][0],
+                        "object2": m["pair"][1],
+                        "expected": m["expected"],
+                        "reconstructed": m["reconstructed"],
+                    }
+                )
+
             pd.DataFrame(rows).to_csv(output_file, index=False)
             print(f"Mismatch report saved to {output_file}")
-    
+
         return mismatches
+
     def _construct_plot_data_with_dimensions(self):
         """
         Construct plot data for the generated random scenario including dimensions
@@ -2111,85 +2583,81 @@ class CLIScenarioDesigner:
                 plot_data.append(frame_objects)
 
         return plot_data
+
     def plot_cactus(self, df):
 
-        plt.figure(figsize=(8,6))
-    
+        plt.figure(figsize=(8, 6))
+
         groups = df.groupby("objects")
-    
+
         for obj, g in groups:
-    
             g = g.sort_values("frames")
-    
-            plt.plot(
-                g["frames"],
-                g["time"],
-                marker="o",
-                label=f"{obj} objects"
-            )
-    
+
+            plt.plot(g["frames"], g["time"], marker="o", label=f"{obj} objects")
+
         plt.xlabel("Number of Frames")
         plt.ylabel("Solve Time (seconds)")
         plt.title("Scenario Reconstruction Performance")
-    
+
         plt.legend()
-    
+
         plt.grid(True)
-    
+
         plt.tight_layout()
-    
+
         plt.savefig("cactus_plot.png", dpi=300)
-    
+
         print("Plot saved to cactus_plot.png")
-    
-        #plt.show()
+
+        # plt.show()
+
     def run_folder_experiment(self, folder, solver="gecode", heuristic="default"):
 
         import glob
         import time
-    
+
         results = []
-    
+
         files = glob.glob(os.path.join(folder, "*.csv"))
-    
+
         print(f"\nRunning experiment on {len(files)} scenes\n")
-    
+
         for f in sorted(files):
-    
             print("=================================")
             print("Scene:", f)
-    
+
             start = time.time()
-    
+
             self.load_from_csv(f)
-    
+
             result, stats = self.solve(
-                solver_name=solver,
-                heuristic=heuristic,
-                refinements=0
+                solver_name=solver, heuristic=heuristic, refinements=0
             )
-    
+
             elapsed = stats[-1]["time"] if stats else None
-    
+
             num_objects = len(self.objects)
             num_frames = self.num_frames
-    
-            results.append({
-                "scene": os.path.basename(f),
-                "objects": num_objects,
-                "frames": num_frames,
-                "time": elapsed
-            })
-    
+
+            results.append(
+                {
+                    "scene": os.path.basename(f),
+                    "objects": num_objects,
+                    "frames": num_frames,
+                    "time": elapsed,
+                }
+            )
+
             print(f"Objects: {num_objects}  Frames: {num_frames}  Time: {elapsed}")
-    
+
             df = pd.DataFrame(results)
-    
+
             df.to_csv("experiment_results.csv", index=False)
-    
+
             print("\nResults saved to experiment_results.csv")
-    
+
             self.plot_cactus(df)
+
     def plot_all_frames(self, result=None, output_dir=None):
         """Plot all frames, using result if available, otherwise generated scenario"""
         return self.plot_scenario(result=result, output_dir=output_dir, show_plots=True)
@@ -2267,7 +2735,7 @@ class CLIScenarioDesigner:
                         va="center",
                         fontsize=2,
                         fontweight="bold",
-                       # bbox=bbox_props,
+                        # bbox=bbox_props,
                     )
 
             # Add legend
@@ -2326,12 +2794,12 @@ Examples:
     )
 
     # Input options
-    #input_group = parser.add_mutually_exclusive_group(required=True)
+    # input_group = parser.add_mutually_exclusive_group(required=True)
     parser.add_argument(
-        "--generate", action="store_false", help="Generate random scenario"
+        "--generate", action="store_true", help="Generate random scenario"
     )
     parser.add_argument(
-        "--import-file",default="/home/nassim/local_nuscenes/SmartForce_scene-0002.csv", type=str, metavar="FILE", help="Import scenario from CSV file"
+        "--import-file", type=str, metavar="FILE", help="Import scenario from CSV file"
     )
 
     # Generation parameters
@@ -2365,9 +2833,9 @@ Examples:
     parser.add_argument(
         "--solver",
         type=str,
-        default="gecode",
-        choices=["gecode", "chuffed", "coin-bc", "cp-sat"],
-        help="MiniZinc solver to use (default: gecode)",
+        default="ga",
+        choices=["ga"],
+        help="Solver to use (default and only choice: ga)",
     )
     parser.add_argument(
         "--heuristic",
@@ -2387,18 +2855,26 @@ Examples:
     parser.add_argument(
         "--timeout", type=int, default=None, help="Solver timeout in seconds"
     )
+
+    # GA-specific options
+    parser.add_argument(
+        "--population-size",
+        type=int,
+        default=2000,
+        help="GA population size (default: 5000, only used with --solver ga)",
+    )
     parser.add_argument(
         "--import-folder",
         type=str,
         default=None,
-        help="Run solver on every CSV scene in a folder"
+        help="Run solver on every CSV scene in a folder",
     )
     # Output options
     parser.add_argument(
         "--output",
         "-o",
         type=str,
-        default="scenario_result.csv",
+        default="scenario_result_ga.csv",
         help="Output CSV file for solution (default: scenario_result.csv)",
     )
     parser.add_argument(
@@ -2447,19 +2923,16 @@ Examples:
     )
 
     args = parser.parse_args()
-    args.FILE= 'SmartForce_scene-0001.csv'
+
     # Create designer
     designer = CLIScenarioDesigner()
-    args.generate=False
+
     # Load or generate scenario
     if args.import_folder:
-
         designer.run_folder_experiment(
-            args.import_folder,
-            solver=args.solver,
-            heuristic=args.heuristic
+            args.import_folder, solver=args.solver, heuristic=args.heuristic
         )
-    
+
         return
     if args.generate:
         print(
@@ -2495,8 +2968,8 @@ Examples:
     if args.verbose:
         designer.print_summary()
 
-    heuristics_to_test = ["frame-wise"]
-    solvers = ["cp-sat"]
+    solvers = [args.solver]
+    heuristics_to_test = [args.heuristic]
     # Solve with statistics
     for s in solvers:
         for h in heuristics_to_test:
@@ -2506,9 +2979,8 @@ Examples:
                 heuristic=h,
                 timeout=args.timeout,
                 refinements=args.refinements,
+                population_size=args.population_size,
             )
-
-
 
             for result, stats in zip(all_result, all_stats):
                 # Save solver statistics
@@ -2550,7 +3022,6 @@ Examples:
                     if "failures" in stats:
                         print(f"  Failures: {stats['failures']}")
 
-                    
                     if args.verbose:
                         designer.print_summary(result)
 
@@ -2560,10 +3031,11 @@ Examples:
                     result_output = f"{base}_o{args.num_objects}_f{args.num_frames}_s{args.seed}_{s}_{h}_r{refinement_iteration}.csv"
 
                     designer.export_to_csv(result, result_output)
-                    designer.reconstruct_and_compare(
-                        result,
-                        output_file="reconstruction_check.csv"
-                    )
+
+                    if not args.generate:
+                        designer.reconstruct_and_compare(
+                            result, output_file="reconstruction_check.csv"
+                        )
                     print(f"\nResult saved to {result_output}")
 
                     # Plot if requested
